@@ -65,7 +65,9 @@ behaves:
 | `GUARD_REASON_CODES` numbers | contract | **Append-only** | Numeric codes are never renumbered and never reused; removed variants keep their number. |
 | `describeGuardEvent()` text | SDK | **Internal** | A log line, not a format. Parse `GuardEvent`, not this string. |
 | `poll()` `cursor` / `latestLedger` | RPC | **Best-effort** | Pagination is host-defined; treat as opaque. |
-| `serializeEvent()` output | SDK | **Stable** | Canonical JSON line. Fixed key order and normalization policy — see below. |
+| `serializeEvent()` output | SDK | **Stable** | Canonical JSON line. Fixed key order and normalization policy — see below. Unversioned; legacy records are v0. |
+| `serializeEventRecord()` output | SDK | **Stable within `v: 1`** | Versioned envelope `{ "v": 1, "event": { … } }`. A new envelope version is a documented change; readers must branch on `v`, not assume the current one. |
+| `PollResult.dropped` | SDK | **Append-only** | Per-page rejection counts: `unknownTopic`, `foreignContract`, `missingContractId`, `malformedContractId`. New reasons may be added. |
 
 ### Canonical JSON serialization — `serializeEvent()`
 
@@ -121,6 +123,74 @@ modulo those normalizations — `bigint` becomes a decimal string, bytes become
 
 `serializeEvent()` is a format; `describeGuardEvent()` remains **Internal** (a
 log line, not a format), and the two are independent.
+
+### Versioned event records — `serializeEventRecord()` (issue #323)
+
+`serializeEvent()` is deliberately left byte-identical: its output is a
+**Stable** contract, so adding a version field in place would silently change
+what every existing JSON-lines consumer parses. Persisted records opt in to an
+explicitly versioned envelope instead:
+
+```ts
+import { serializeEventRecord, parseEventRecord } from "stellar-agent-guard-sdk";
+
+const line = serializeEventRecord(event);
+// {"v":1,"event":{"id":"ledger:…","kind":"auth_checked",…}}
+
+const { version, event } = parseEventRecord(line);
+// version === 1; `event` is the same projection serializeEvent() emits.
+```
+
+- **Envelope:** `{ "v": <positive integer>, "event": <canonical event> }`, `v`
+  first. `TELEMETRY_EVENT_RECORD_VERSION` is the current version (`1`).
+- **Bare `serializeEvent()` output is legacy v0.** It has no top-level `v` key,
+  so `parseEventRecord()` reports `version: 0` and returns the event unchanged.
+  Older records therefore remain identifiable without rewriting them.
+- **No silent break:** the `event` member is exactly the historical projection —
+  same key order, same drop-`undefined`/keep-`null` policy, same `bigint` and
+  byte normalization. A consumer can keep using its existing field parser on
+  `record.event`.
+- **JSON-safe:** the envelope is rendered through the same `toJsonSafe()` path
+  as `serializeEvent()`, so a heartbeat's `bigint` `data.at` is a decimal string
+  and `JSON.parse` reads the line back.
+- **Newer records are surfaced, not guessed at:** `parseEventRecord()` returns a
+  `v` newer than `TELEMETRY_EVENT_RECORD_VERSION` as-is so a caller can detect
+  and route it; it does not reinterpret it. Malformed envelopes throw.
+
+**Golden fixture:** `tests/fixtures/telemetry/event-record-v1.golden.json` pins
+one complete v1 record; `tests/unit/serialize-event.test.ts` asserts the writer
+matches it byte-for-byte. Bumping the envelope is a deliberate diff in that
+fixture plus a migration note — not an incidental change.
+
+**Migration note (v0 → v1):** no action is required for existing logs. A stored
+bare line parses as `version: 0`; a new v1 line carries `v: 1` and the same
+event fields under `event`. Readers that only understand bare records can keep
+reading historical data; to read new data they should switch to
+`parseEventRecord()` (or unwrap `event` after checking `v`).
+
+### Emitting-identity validation before decode (issue #322)
+
+`poll()` filters by contract at the RPC, but does **not** trust that filter. An
+event is decoded only when it reports an emitting contract and that contract
+canonicalises to the configured guard; otherwise it is dropped *before* the
+topic vocabulary is examined. This is what stops a faulty or proxying RPC from
+injecting another contract's guard-shaped topic into the guard's telemetry and
+having it reported as a decision.
+
+Handling is fail-closed and visible:
+
+| RPC `contractId` | Handling | `PollResult.dropped` bucket |
+| --- | --- | --- |
+| A contract address equal to the guard | Decode | — |
+| A contract address other than the guard | Drop | `foreignContract` |
+| Missing / `null` / empty | Drop (identity unverifiable) | `missingContractId` |
+| Present but not a contract address | Drop | `malformedContractId` |
+| Recognised identity, unknown name topic | Drop (normal rule 1 above) | `unknownTopic` |
+
+All four counters are zero on a fully attributable page, and the total is also
+logged (`dropped`, with the breakdown in `droppedByReason`). The diagnostic and
+failed-transaction streams already attributed only the configured guard's
+events (`emittedByGuard`); this closes the same gap on the committed stream.
 
 ## How it was captured
 
@@ -419,7 +489,9 @@ enum.
 
 ## Consequence for the telemetry listener
 
-The listener (Phase 2.4) filters on `event_auth_checked` and reads the decision
+The listener (Phase 2.4) re-checks the emitting contract id before decoding
+(see "Emitting-identity validation before decode") and then filters on
+`event_auth_checked` and reads the decision
 from topics, requiring no payload decoding. It must consume **both** streams:
 committed ledger events for allowed decisions and administrative actions, and
 enforced-simulation diagnostic events for blocked ones — because a refusal is

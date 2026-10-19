@@ -134,7 +134,9 @@ one-shot form.
   - `constructor(options: GuardTelemetryListenerOptions)`
   - `watch(params?: GuardTelemetryWatchParams): AsyncIterable<GuardEventPage>` — Tails on-chain and uncommitted events. `params.signal` aborts at loop boundaries: no RPC call before the first pull, no poll after an abort, and the delay between polls is cut short. A request already in flight cannot be cancelled — see [Aborting a watch](../README.md#aborting-a-watch-what-cancellation-does-and-does-not-cover).
   - `watchAll(params?: GuardTelemetryUnifiedParams): AsyncIterable<GuardEvent>` — Merges the committed ledger stream with the `diagnostics` batches you feed it into **one ordered, de-duplicated stream**, so a single loop sees blocked decisions too. Each event carries `stream: 'committed' | 'diagnostic'` and, for diagnostics, `observedAt`. Ordering and de-duplication rules: [`event-schema.md`](event-schema.md).
-  - `serializeEvent(event: GuardEvent): string` — Canonical single-line JSON for deterministic JSON-lines log shipping. Fixed key order, drops `undefined`, keeps `null`, renders `bigint` as a decimal string. Contract: [`event-schema.md`](event-schema.md#canonical-json-serialization--serializeevent).
+  - `serializeEvent(event: GuardEvent): string` — Canonical single-line JSON for deterministic JSON-lines log shipping. Fixed key order, drops `undefined`, keeps `null`, renders `bigint` as a decimal string. Unversioned legacy (v0) format. Contract: [`event-schema.md`](event-schema.md#canonical-json-serialization--serializeevent).
+  - `serializeEventRecord(event: GuardEvent): string` — Persisted-record envelope `{ "v": 1, "event": { … } }` with the same event projection as `serializeEvent()`; `v` is explicit so a reader can tell a record written by a newer SDK. See [Versioned event records](event-schema.md#versioned-event-records--serializeeventrecord-issue-323).
+  - `parseEventRecord(line: string): { version, event }` — Reads either a versioned envelope or a legacy bare line (reported as `version: 0`).
 - `validateGuardPolicy(policy: unknown, options?: ValidatePolicyOptions | string): PolicyFailure[]` — Validates policy configuration against SPEC §8 rules prior to broadcast, accumulating all failures for complete form UX.
 - `POLICY_RULE_IDS` — Canonical array of SPEC §8 validation rule identifiers.
 - `policyToScVal(policy: PolicyConfig): xdr.ScVal` — Encodes a policy as the contract's canonical sorted ScVal struct.
@@ -243,6 +245,15 @@ for await (const event of listener.watchAll({ diagnostics })) {
 ```
 
 Key order, the drop-`undefined`/keep-`null` policy, and the `bigint`-to-decimal-string normalization are documented in [`event-schema.md`](event-schema.md#canonical-json-serialization--serializeevent).
+
+For **persisted** records, prefer the versioned envelope so a future schema change is distinguishable from a historical line:
+
+```ts
+import { parseEventRecord, serializeEventRecord } from "stellar-agent-guard-sdk";
+
+logger.info(serializeEventRecord(event)); // {"v":1,"event":{…}}
+const { version, event: decoded } = parseEventRecord(storedLine); // version 0 = legacy
+```
 
 #### Describing a policy (issue #343)
 

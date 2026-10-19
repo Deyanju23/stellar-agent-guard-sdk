@@ -437,6 +437,26 @@ function dataOf(raw: unknown): unknown {
   return body?.v0?.data ?? body?.value?.v0?.data;
 }
 
+/**
+ * Canonicalise a contract address supplied by the RPC, or return null when it is
+ * absent/malformed.
+ *
+ * Identity is compared in canonical `C...` form rather than as an opaque
+ * string: an RPC that upper/lower-cases or pads the field must not be able to
+ * slip a foreign event past the check, and a value that is not a contract
+ * strkey at all is not something this SDK can attribute to a guard (#322).
+ */
+function canonicalContractId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  try {
+    return StrKey.encodeContract(StrKey.decodeContract(trimmed));
+  } catch {
+    return null;
+  }
+}
+
 /** True only when the diagnostic's emitting contract is this guard. */
 function emittedByGuard(raw: unknown, guard: string): boolean {
   const bare = (raw as { event?: unknown }).event ?? raw;
@@ -710,11 +730,36 @@ export interface GuardTelemetryConfig {
   cursorStore?: CursorStore;
 }
 
+/**
+ * Per-page count of events the listener refused to decode (#322).
+ *
+ * Identity is checked *before* decoding: an event is only interpreted when the
+ * RPC reports an emitting contract and that contract is the configured guard.
+ * A page from a faulty or proxying RPC therefore cannot inject another
+ * contract's guard-shaped topic into this guard's telemetry. The split exists
+ * so "the guard was quiet" is distinguishable from each rejection reason.
+ */
+export interface GuardEventDropCounts {
+  /** Events whose name topic this SDK version does not know. */
+  unknownTopic: number;
+  /** Events emitted by a contract other than the configured guard. */
+  foreignContract: number;
+  /** Events whose `contractId` the RPC omitted — identity cannot be verified. */
+  missingContractId: number;
+  /** Events whose `contractId` was present but is not a contract address. */
+  malformedContractId: number;
+}
+
 export interface PollResult {
   events: GuardEvent[];
   /** Cursor to resume from, as returned by the RPC. */
   cursor: string;
   latestLedger: number;
+  /**
+   * Why this page's events were dropped, by reason (#322). All four counts are
+   * zero on a page where every event was attributable to the guard.
+   */
+  dropped: GuardEventDropCounts;
   /**
    * Oldest ledger the RPC still retains, from the same response
    * (`Api.RetentionState.oldestLedger`).
@@ -964,7 +1009,14 @@ export interface GuardTelemetryStats {
   blocked: number;
   /** Blocked decisions in the window, keyed by reason. */
   byReason: Record<string, number>;
-  /** Timestamp (per the injected clock) of the oldest decision in the window. */
+  /**
+   * Timestamp of the oldest decision in the window, on the counter's monotonic
+   * timeline (#320). It is the observation time clamped to never move backwards:
+   * after a wall-clock rollback it holds the previous high-water mark rather
+   * than a value in the past, and when the window is empty it is the current
+   * monotonic time. It is **not** a wall-clock reading to compare with
+   * `Date.now()`; treat it as the start of the retained interval.
+   */
   windowStart: number;
 }
 
@@ -989,6 +1041,17 @@ export class GuardDecisionCounters {
   private allowed = 0;
   private blocked = 0;
   private readonly byReason = new Map<string, number>();
+  /**
+   * High-water mark of the injected clock (#320).
+   *
+   * Eviction runs on a **monotonic** timeline: every observation is clamped to
+   * `Math.max(now, lastObservedAt)`. A wall-clock rollback (NTP correction, a
+   * container moved between hosts, a date set backwards) therefore cannot push
+   * the eviction cutoff backwards and leave entries retained past the
+   * advertised window. Forward jumps are honoured immediately, so a clock that
+   * leaps ahead still expires stale entries. `null` until the first observation.
+   */
+  private lastObservedAt: number | null = null;
 
   constructor(options: GuardTelemetryCountersOptions) {
     const { windowEvents, windowMs } = options;
@@ -1014,7 +1077,7 @@ export class GuardDecisionCounters {
     if (event.kind !== "auth_checked" || event.decision === null) return;
     const verdict = isAllowedDecision(event.decision) ? "allowed" : "blocked";
     const reason = event.decision.reason ?? null;
-    const at = this.clock();
+    const at = this.monotonicNow();
     this.entries.push({ verdict, reason, at });
     if (verdict === "allowed") this.allowed += 1;
     else {
@@ -1022,6 +1085,22 @@ export class GuardDecisionCounters {
       if (reason !== null) this.byReason.set(reason, (this.byReason.get(reason) ?? 0) + 1);
     }
     this.evict();
+  }
+
+  /**
+   * Current time on the counter's monotonic timeline.
+   *
+   * The first observation establishes the epoch. From then on the clock may
+   * only move forward: a backward step reads as the high-water mark, and a
+   * forward step advances it. `stats()` may be the first caller, which is fine
+   * — with no entries there is nothing to retain.
+   */
+  private monotonicNow(): number {
+    const observed = this.clock();
+    if (this.lastObservedAt === null || observed > this.lastObservedAt) {
+      this.lastObservedAt = observed;
+    }
+    return this.lastObservedAt;
   }
 
   /** Drop entries that have aged out of the window. */
@@ -1032,7 +1111,7 @@ export class GuardDecisionCounters {
       }
       return;
     }
-    const cutoff = this.clock() - (this.windowMs ?? 0);
+    const cutoff = this.monotonicNow() - (this.windowMs ?? 0);
     while (this.entries.length > 0 && this.entries[0]!.at < cutoff) {
       this.remove(this.entries.shift()!);
     }
@@ -1058,7 +1137,7 @@ export class GuardDecisionCounters {
       allowed: this.allowed,
       blocked: this.blocked,
       byReason: Object.fromEntries(this.byReason),
-      windowStart: this.entries.length > 0 ? this.entries[0]!.at : this.clock(),
+      windowStart: this.entries.length > 0 ? this.entries[0]!.at : this.monotonicNow(),
     };
   }
 }
@@ -1313,6 +1392,8 @@ export class ConcurrentTelemetryStreamError extends GuardError {
 export class GuardTelemetryListener {
   private readonly config: GuardTelemetryConfig;
   private readonly logger: GuardLogger;
+  /** The configured guard in canonical `C...` form, for identity comparison. */
+  private readonly guardContractId: string;
 
   /** Lease for the one stream currently allowed to mutate listener state. */
   private activeStreamLease: symbol | null = null;
@@ -1360,6 +1441,7 @@ export class GuardTelemetryListener {
   constructor(config: GuardTelemetryConfig | GuardTelemetryLocalConfig = {}) {
     const resolved = config as GuardTelemetryConfig;
     this.config = resolved;
+    this.guardContractId = canonicalContractId(resolved.guard) ?? resolved.guard ?? "";
     this.logger = resolveLogger(resolved.logger);
     this.buffer = resolved.buffer ? new GuardEventRingBuffer(resolved.buffer.max) : null;
     this.activeCursorStore = resolved.cursorStore ?? new InMemoryCursorStore();
@@ -1508,8 +1590,14 @@ export class GuardTelemetryListener {
   /**
    * One page of committed guard events at or after `startLedger`.
    *
-   * Filters server-side by contract id, so the listener only ever sees this
-   * guard's own events — the topic vocabulary then narrows further, and an
+   * Filters server-side by contract id, but does not trust that filter: the
+   * emitting contract is re-checked client-side before any event is decoded
+   * (#322). A faulty or proxying RPC that returns a foreign contract's
+   * guard-shaped topic is dropped, never reported as this guard's decision.
+   * Events with a missing or malformed `contractId` fail closed for the same
+   * reason — their identity cannot be verified. Rejections are counted per
+   * reason in `PollResult.dropped` and logged, so the drop is visible rather
+   * than silent. The topic vocabulary then narrows further, and an
    * unrecognised topic is dropped rather than guessed at.
    */
   async poll(params: { startLedger?: number; cursor?: string; limit?: number } = {}): Promise<PollResult> {
@@ -1536,9 +1624,29 @@ export class GuardTelemetryListener {
     // is a coverage fact a host may need to see, and counting it is the only
     // way to tell "the guard was quiet" from "the guard spoke in a vocabulary
     // this SDK version does not know".
-    let dropped = 0;
+    const dropped: GuardEventDropCounts = {
+      unknownTopic: 0,
+      foreignContract: 0,
+      missingContractId: 0,
+      malformedContractId: 0,
+    };
     for (const event of response.events) {
-      const contractId = event.contractId ? String(event.contractId) : null;
+      const rawContractId = (event as { contractId?: unknown }).contractId;
+      if (rawContractId === undefined || rawContractId === null || rawContractId === "") {
+        // Fail closed: without an emitting identity the event cannot be shown to
+        // belong to this guard, and the server-side filter is what is in doubt.
+        dropped.missingContractId += 1;
+        continue;
+      }
+      const contractId = canonicalContractId(rawContractId);
+      if (contractId === null) {
+        dropped.malformedContractId += 1;
+        continue;
+      }
+      if (contractId !== this.guardContractId) {
+        dropped.foreignContract += 1;
+        continue;
+      }
       const decoded = interpret(
         event.topic.map((topic) => String(scValToNative(topic))),
         decodeData(event.value),
@@ -1558,14 +1666,20 @@ export class GuardTelemetryListener {
         },
       );
       if (decoded) events.push(decoded);
-      else dropped += 1;
+      else dropped.unknownTopic += 1;
     }
     sortCommittedPage(events);
     const oldestLedger = typeof response.oldestLedger === "number" ? response.oldestLedger : null;
+    const droppedTotal =
+      dropped.unknownTopic +
+      dropped.foreignContract +
+      dropped.missingContractId +
+      dropped.malformedContractId;
     this.logger.debug("telemetry page received", {
       guard: this.config.guard,
       events: events.length,
-      dropped,
+      dropped: droppedTotal,
+      droppedByReason: dropped,
       latestLedger: response.latestLedger,
       oldestLedger,
     });
@@ -1574,6 +1688,7 @@ export class GuardTelemetryListener {
       events,
       cursor: response.cursor,
       latestLedger: response.latestLedger,
+      dropped,
       // Best-effort: a host that omits the retention boundary gets no gap
       // detection, rather than a boundary invented from `latestLedger`.
       oldestLedger,
@@ -1973,6 +2088,11 @@ function toJsonSafe(value: unknown): unknown {
  * `docs/event-schema.md` under "Canonical JSON serialization".
  */
 export function serializeEvent(event: GuardEvent): string {
+  return JSON.stringify(toJsonSafe(projectEvent(event)));
+}
+
+/** The bare, unversioned projection `serializeEvent()` has always emitted. */
+function projectEvent(event: GuardEvent): Record<string, unknown> {
   const projected: Record<string, unknown> = {};
   for (const key of EVENT_KEY_ORDER) {
     const value = event[key];
@@ -1988,7 +2108,93 @@ export function serializeEvent(event: GuardEvent): string {
     }
     projected.decision = decision;
   }
-  return JSON.stringify(toJsonSafe(projected));
+  return projected;
+}
+
+/**
+ * Current version of the serialized event-record envelope (#323).
+ *
+ * `serializeEvent()` remains the unversioned v0 format it has always been: its
+ * output is a documented **Stable** contract, so changing it in place would
+ * silently break every consumer of stored JSON-lines. Persisted records instead
+ * opt in to `serializeEventRecord()`, whose envelope carries this version
+ * explicitly. A legacy line is identifiable by the absence of `v` (v0).
+ */
+export const TELEMETRY_EVENT_RECORD_VERSION = 1;
+
+/**
+ * One versioned, JSON-safe telemetry record: `{ "v": 1, "event": { ... } }`.
+ *
+ * The envelope keeps the event projection byte-identical to `serializeEvent()`'s
+ * output — only the version wrapper is new — so a v1 reader can hand `event` to
+ * any existing consumer, and a v0 reader that ignores unknown top-level keys can
+ * still find the event fields. See `docs/event-schema.md` for the migration
+ * note and `tests/fixtures/telemetry/event-record-v1.golden.json` for the golden
+ * fixture.
+ */
+export interface GuardEventRecord {
+  /** Envelope schema version; `TELEMETRY_EVENT_RECORD_VERSION` at write time. */
+  v: number;
+  /** The canonical event projection, identical to `serializeEvent()`'s object. */
+  event: Record<string, unknown>;
+}
+
+/**
+ * Serialize one event inside a versioned envelope, for persisted JSON-lines.
+ *
+ * Rendering rules are exactly `serializeEvent()`'s (fixed key order, drop
+ * `undefined`, keep `null`, `bigint` → decimal string, bytes → `bytes:<hex>`),
+ * so the value is JSON-safe and deterministic. The envelope adds `v` as the
+ * first key; `event` follows with the historical field order.
+ */
+export function serializeEventRecord(event: GuardEvent): string {
+  const record: GuardEventRecord = {
+    v: TELEMETRY_EVENT_RECORD_VERSION,
+    event: projectEvent(event),
+  };
+  return JSON.stringify(toJsonSafe(record));
+}
+
+/** The result of reading one stored telemetry line. */
+export interface ParsedGuardEventRecord {
+  /**
+   * `0` for a legacy bare event line written before the envelope existed,
+   * otherwise the envelope's `v`. A version greater than
+   * `TELEMETRY_EVENT_RECORD_VERSION` is returned as-is so a caller can detect a
+   * record written by a newer SDK rather than silently mis-order its fields.
+   */
+  version: number;
+  /** The event projection, unmodified. */
+  event: Record<string, unknown>;
+}
+
+/**
+ * Read one stored telemetry line, versioned or legacy (#323).
+ *
+ * Older records remain identifiable: a bare event line (no `v` key) is
+ * reported as `version: 0`, while an envelope reports its own version. The
+ * parser is deliberately shallow — it identifies the format, it does not
+ * validate every event field — so an unknown-but-newer record is still
+ * inspectable. Malformed input throws `TypeError` rather than being guessed at.
+ */
+export function parseEventRecord(line: string): ParsedGuardEventRecord {
+  const parsed: unknown = JSON.parse(line);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new TypeError("telemetry record must be a JSON object");
+  }
+  const record = parsed as Record<string, unknown>;
+  if (!("v" in record)) {
+    return { version: 0, event: record };
+  }
+  const version = record.v;
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    throw new TypeError("telemetry record `v` must be a positive integer");
+  }
+  const event = record.event;
+  if (event === null || typeof event !== "object" || Array.isArray(event)) {
+    throw new TypeError("telemetry record `event` must be a JSON object");
+  }
+  return { version, event: event as Record<string, unknown> };
 }
 
 /** A compact one-line rendering of a guard event, for logs. */

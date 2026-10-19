@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { xdr } from "@stellar/stellar-sdk";
+import { StrKey, xdr } from "@stellar/stellar-sdk";
 import {
   DEFAULT_JITTER_FRACTION,
   GuardEventRingBuffer,
@@ -1573,5 +1573,162 @@ describe("GuardTelemetryListener counters", () => {
     assert.ok(stats);
     assert.equal(stats!.allowed, 2);
     assert.equal(stats!.blocked, 0);
+  });
+});
+
+/**
+ * Wall-clock rollback (#320).
+ *
+ * The counters evict on a monotonic timeline: observations are clamped to the
+ * high-water mark, so a clock that moves backwards cannot extend how long an
+ * entry is retained, and a clock that jumps forward still expires stale entries
+ * immediately. Only an injected clock is used, so there is no wall-clock wait.
+ */
+describe("GuardDecisionCounters wall-clock resilience (issue #320)", () => {
+  const decisionEvent = (
+    result: "allowed" | "blocked",
+    reason: string | null,
+    index: number,
+  ): GuardEvent => ({
+    id: `diag:${index.toString(16).padStart(64, "0")}`,
+    kind: "auth_checked",
+    topic: "event_auth_checked",
+    source: "diagnostic",
+    stream: "diagnostic",
+    contractId: GUARD,
+    ledger: null,
+    ledgerClosedAt: null,
+    observedAt: new Date(index).toISOString(),
+    transactionHash: null,
+    decision: { result, reason, source: "diagnostic" } as GuardEvent["decision"],
+    data: {},
+  });
+
+  it("does not retain entries past the window when the clock rolls back", () => {
+    let now = 1_000;
+    const listener = new GuardTelemetryListener({
+      counters: { windowMs: 1_000 },
+      clock: () => now,
+    });
+    listener.observe(decisionEvent("blocked", "per_tx_cap_exceeded", 0));
+
+    // A rollback must not move the eviction cutoff backwards. The entry stays
+    // retained only for the original window, measured on internal time.
+    now = 0;
+    listener.observe(decisionEvent("allowed", null, 1));
+    let stats = listener.stats();
+    assert.ok(stats);
+    assert.equal(stats!.allowed + stats!.blocked, 2, "a rollback does not evict early");
+    assert.equal(stats!.windowStart, 1_000, "clamped to the high-water mark, not the rolled-back value");
+
+    // Still inside the window on the monotonic timeline (cutoff 999).
+    now = 1_999;
+    stats = listener.stats();
+    assert.equal(stats!.allowed + stats!.blocked, 2);
+
+    // One millisecond past the window: both entries at t=1000 age out.
+    now = 2_001;
+    stats = listener.stats();
+    assert.equal(stats!.allowed, 0);
+    assert.equal(stats!.blocked, 0);
+    assert.deepEqual(stats!.byReason, {});
+    assert.equal(stats!.windowStart, 2_001, "an empty window starts at the current monotonic time");
+  });
+
+  it("honours a forward jump immediately", () => {
+    let now = 1_000;
+    const listener = new GuardTelemetryListener({
+      counters: { windowMs: 1_000 },
+      clock: () => now,
+    });
+    listener.observe(decisionEvent("blocked", "per_tx_cap_exceeded", 0));
+    now = 5_000;
+    const stats = listener.stats();
+    assert.ok(stats);
+    assert.equal(stats!.blocked, 0);
+    assert.deepEqual(stats!.byReason, {});
+  });
+});
+
+/**
+ * Emitting-identity validation before decoding (#322).
+ *
+ * `poll()` filters by contract server-side, but does not trust that filter. An
+ * RPC that returns another contract's guard-shaped topic must not have it
+ * reported as this guard's decision; missing or malformed identity fails closed
+ * and every rejection is counted in `PollResult.dropped`.
+ */
+describe("GuardTelemetryListener event identity validation (issue #322)", () => {
+  const FOREIGN = StrKey.encodeContract(new Uint8Array(32).fill(7));
+
+  function eventFor(contractId: unknown, topics: string[]) {
+    return {
+      ...(contractId === undefined ? {} : { contractId }),
+      type: "contract",
+      ledger: 500,
+      ledgerClosedAt: "2026-09-27T00:00:00Z",
+      txHash: "ab".repeat(32),
+      topic: topics.map((topic) => xdr.ScVal.scvSymbol(topic)),
+      value: xdr.ScVal.scvMap([]),
+    };
+  }
+
+  function serverFor(events: unknown[]) {
+    return {
+      getLatestLedger: async () => ({ sequence: 600 }),
+      getEvents: async () => ({ events, cursor: "cursor_1", latestLedger: 600 }),
+    };
+  }
+
+  it("drops a foreign contract's guard-shaped topic instead of reporting a decision", async () => {
+    const foreign = eventFor(FOREIGN, ["event_auth_checked", "allowed", ""]);
+    const own = eventFor(GUARD, ["event_auth_checked", "blocked", "per_tx_cap_exceeded"]);
+    const listener = new GuardTelemetryListener({
+      server: serverFor([foreign, own]) as never,
+      guard: GUARD,
+    });
+
+    const page = await listener.poll({ startLedger: 100 });
+    assert.equal(page.events.length, 1);
+    assert.equal(page.events[0]!.contractId, GUARD);
+    assert.equal(page.events[0]!.decision?.reason, "per_tx_cap_exceeded");
+    assert.deepEqual(page.dropped, {
+      unknownTopic: 0,
+      foreignContract: 1,
+      missingContractId: 0,
+      malformedContractId: 0,
+    });
+  });
+
+  it("fails closed on missing and malformed identity, and counts each reason", async () => {
+    const listener = new GuardTelemetryListener({
+      server: serverFor([
+        eventFor(undefined, ["event_auth_checked", "allowed", ""]),
+        eventFor("not-a-contract", ["event_auth_checked", "allowed", ""]),
+        eventFor(GUARD, ["event_auth_checked", "allowed", ""]),
+        eventFor(GUARD, ["event_not_in_this_version"]),
+      ]) as never,
+      guard: GUARD,
+    });
+
+    const page = await listener.poll({ startLedger: 100 });
+    assert.equal(page.events.length, 1, "only the verifiable, known-topic event decodes");
+    assert.deepEqual(page.dropped, {
+      unknownTopic: 1,
+      foreignContract: 0,
+      missingContractId: 1,
+      malformedContractId: 1,
+    });
+  });
+
+  it("accepts identity reported with surrounding whitespace by canonicalising it", async () => {
+    const padded = ` ${GUARD} `;
+    const listener = new GuardTelemetryListener({
+      server: serverFor([eventFor(padded, ["event_auth_checked", "allowed", ""])]) as never,
+      guard: GUARD,
+    });
+    const page = await listener.poll({ startLedger: 100 });
+    assert.equal(page.events.length, 1);
+    assert.equal(page.events[0]!.contractId, GUARD);
   });
 });

@@ -132,6 +132,22 @@ The returned object is a deep snapshot: mutating it never affects the listener's
 state. When `counters` is not set, `stats()` returns `null` and no counter
 structures are allocated.
 
+`windowStart` is on the counter's **monotonic** timeline, not a raw wall-clock
+reading. Observations are clamped to a non-decreasing internal time, so a
+backward clock step (NTP correction, host move, manual date change) cannot
+extend how long an entry is retained; a forward jump expires stale entries
+immediately. For an empty window it reports the current monotonic time. Do not
+compare it with `Date.now()`; use it as the start of the retained interval.
+
+### `poll()` dropped-event counts
+
+`poll()` re-checks the emitting `contractId` before decoding rather than
+trusting the RPC's contract filter. `PollResult.dropped` reports every rejection
+by reason — `unknownTopic`, `foreignContract`, `missingContractId`,
+`malformedContractId` — and the same breakdown is logged with the page summary.
+Events with missing or malformed identity fail closed. See
+[`event-schema.md`](../event-schema.md#emitting-identity-validation-before-decode-issue-322).
+
 ## Event identity
 
 Every decoded `GuardEvent` carries a stable, non-null `id` on both streams:

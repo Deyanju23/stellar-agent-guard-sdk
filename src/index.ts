@@ -262,6 +262,7 @@ export {
   type GuardTelemetryGapReason,
   type GuardTelemetryUnifiedParams,
   type GuardTelemetryWatchParams,
+  type GuardUnknownTopic,
   type ParsedGuardEventRecord,
   type PollResult,
   type PollSleep,

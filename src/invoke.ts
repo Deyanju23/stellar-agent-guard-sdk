@@ -21,6 +21,7 @@ import { feeBreakdown, type FeeBreakdown } from "./cost.ts";
 import {
   BroadcastError,
   ContractResponseError,
+  FeeCapExceededError,
   GuardError,
   SigningError,
   SimulationError,
@@ -421,6 +422,17 @@ export interface FeeBumpConfig {
    * Default: 100 stroops (`INCLUSION_FEE`).
    */
   initialInclusionFee?: bigint | string | undefined;
+  /**
+   * Absolute ceiling on the inclusion fee a fee-bump retry may broadcast, in
+   * stroops. Omit it for unbounded (multiplier-only) growth.
+   *
+   * Before a fee-bumped broadcast, the computed inclusion fee is compared with
+   * this ceiling. A breach stops retrying and returns an `error` outcome
+   * carrying {@link FeeCapExceededError}; the over-cap transaction is never
+   * broadcast. Must be a positive bigint (or base-10 integer string) greater
+   * than `initialInclusionFee`, validated at the `invoke()` boundary.
+   */
+  maxInclusionFee?: bigint | string | undefined;
 }
 
 /**
@@ -603,6 +615,18 @@ export interface InvokeParams {
    */
   onRetry?: ((event: InvokeRetryEvent) => void) | undefined;
   /**
+   * Optional hook reporting this process's per-source-account queue.
+   *
+   * `waiting` fires when a call joins the queue (before its turn), and
+   * `acquired` when it starts running, so a busy fleet can be told apart from a
+   * slow RPC. Events are emitted in acquisition (FIFO) order. The hook is
+   * isolated like `onStep`: a throw is swallowed and can never stall the queue.
+   *
+   * The queue and its counters are per process, not global: another process
+   * using the same source account is invisible here.
+   */
+  onQueue?: ((event: InvokeQueueEvent) => void) | undefined;
+  /**
    * Optional hook called **once**, with the network's answer to the
    * broadcast, before any status polling.
    *
@@ -778,6 +802,24 @@ function validateInvokeOptions(params: InvokeParams): void {
     if (feeBump.initialInclusionFee !== undefined) {
       normalizeFeeStroops(feeBump.initialInclusionFee, "feeBump.initialInclusionFee", false);
     }
+    if (feeBump.maxInclusionFee !== undefined) {
+      const ceiling = normalizeFeeStroops(
+        feeBump.maxInclusionFee,
+        "feeBump.maxInclusionFee",
+        false,
+      );
+      const initial =
+        feeBump.initialInclusionFee === undefined
+          ? BigInt(INCLUSION_FEE)
+          : normalizeFeeStroops(feeBump.initialInclusionFee, "feeBump.initialInclusionFee", false);
+      if (ceiling <= initial) {
+        rejectOption(
+          "feeBump.maxInclusionFee",
+          `greater than feeBump.initialInclusionFee (${initial} stroops)`,
+          feeBump.maxInclusionFee,
+        );
+      }
+    }
   }
 
   if (params.pollAttempts !== undefined) {
@@ -914,6 +956,7 @@ function resolveFeeBumpOptions(params: InvokeParams): {
   maxAttempts: number;
   feeMultiplier: number;
   initialInclusionFee: bigint;
+  maxInclusionFee: bigint | undefined;
 } {
   const requested = params.feeBump?.maxAttempts ?? 3;
   const overall = params.maxRetries !== undefined ? params.maxRetries + 1 : Number.POSITIVE_INFINITY;
@@ -926,6 +969,14 @@ function resolveFeeBumpOptions(params: InvokeParams): {
         : normalizeFeeStroops(
             params.feeBump.initialInclusionFee,
             "feeBump.initialInclusionFee",
+            false,
+          ),
+    maxInclusionFee:
+      params.feeBump?.maxInclusionFee === undefined
+        ? undefined
+        : normalizeFeeStroops(
+            params.feeBump.maxInclusionFee,
+            "feeBump.maxInclusionFee",
             false,
           ),
   };
@@ -1288,7 +1339,69 @@ function fullJitterDelay(attempt: number, options: ResolvedRetryOptions): number
 type AccountState = {
   queue: Promise<void>;
   lastReservedSequence?: bigint;
+  /** Calls waiting for this account's turn (not counting the running one). */
+  waiting: number;
+  /** True while a call holds the account queue. */
+  running: boolean;
 };
+
+/** One event from the per-account invoke queue. */
+export interface InvokeQueueEvent {
+  /** `waiting` when the call joins the queue; `acquired` when it starts. */
+  kind: "waiting" | "acquired";
+  /** Source account public key whose queue emitted the event. */
+  source: string;
+  /** Calls ahead of this one: queued waiters plus the running call. */
+  depth: number;
+  /** Time spent waiting, in milliseconds: `0` on `waiting`. */
+  waitedMs: number;
+  /** True only on `acquired`. */
+  acquired: boolean;
+}
+
+/** Snapshot of this process's invoke queues. */
+export interface InvokeQueueStats {
+  /** Calls currently waiting for their turn across all accounts. */
+  depth: number;
+  /** Cumulative queue wait observed since the process started, in ms. */
+  totalWaitedMs: number;
+  /** Calls enqueued since the process started. */
+  enqueued: number;
+}
+
+// Process-local queue counters: they reset when the process restarts, and they
+// cannot see another process that shares the same source account.
+let queueWaiters = 0;
+let cumulativeQueueWaitMs = 0;
+let enqueuedCalls = 0;
+
+/**
+ * Snapshot this process's invoke-queue depth and cumulative wait.
+ *
+ * Per process by construction: a queue is owned by the process that holds the
+ * source account's sequence, so a second process is neither counted nor
+ * coordinated with here.
+ */
+export function invokeQueueStats(): InvokeQueueStats {
+  return {
+    depth: queueWaiters,
+    totalWaitedMs: cumulativeQueueWaitMs,
+    enqueued: enqueuedCalls,
+  };
+}
+
+/** Emit a queue event without letting a broken consumer stall the queue. */
+function emitQueue(
+  hook: ((event: InvokeQueueEvent) => void) | undefined,
+  event: InvokeQueueEvent,
+): void {
+  if (!hook) return;
+  try {
+    hook(event);
+  } catch {
+    /* a broken consumer must not stall or fail the queue */
+  }
+}
 
 const accountStates = new WeakMap<object, Map<string, AccountState>>();
 
@@ -1300,7 +1413,7 @@ function accountStateFor(server: rpc.Server, publicKey: string): AccountState {
   }
   let state = states.get(publicKey);
   if (!state) {
-    state = { queue: Promise.resolve() };
+    state = { queue: Promise.resolve(), waiting: 0, running: false };
     states.set(publicKey, state);
   }
   return state;
@@ -1318,8 +1431,21 @@ async function withAccountQueue<T>(
   server: rpc.Server,
   publicKey: string,
   task: () => Promise<T>,
+  onQueue?: ((event: InvokeQueueEvent) => void) | undefined,
 ): Promise<T> {
   const state = accountStateFor(server, publicKey);
+  const ahead = state.waiting + (state.running ? 1 : 0);
+  const queuedAt = performance.now();
+  state.waiting += 1;
+  queueWaiters += 1;
+  enqueuedCalls += 1;
+  emitQueue(onQueue, {
+    kind: "waiting",
+    source: publicKey,
+    depth: ahead,
+    waitedMs: 0,
+    acquired: false,
+  });
   const previous = state.queue;
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
@@ -1327,9 +1453,22 @@ async function withAccountQueue<T>(
   });
   state.queue = current;
   await previous;
+  const waitedMs = performance.now() - queuedAt;
+  state.waiting -= 1;
+  queueWaiters -= 1;
+  cumulativeQueueWaitMs += waitedMs;
+  state.running = true;
+  emitQueue(onQueue, {
+    kind: "acquired",
+    source: publicKey,
+    depth: state.waiting,
+    waitedMs,
+    acquired: true,
+  });
   try {
     return await task();
   } finally {
+    state.running = false;
     release();
     if (state.queue === current) state.queue = Promise.resolve();
   }
@@ -1463,7 +1602,10 @@ async function invokeWithQueue(
   clock: Clock,
 ): Promise<InvokeOutcome> {
   const sourceKey = await params.source.publicKey();
-  return withAccountQueue(params.server, sourceKey, async () => {
+  return withAccountQueue(
+    params.server,
+    sourceKey,
+    async () => {
     const retry = resolveRetryOptions(params.retry);
     const logger = resolveLogger(params.logger);
     const poll = resolvePollOptions(params);
@@ -1550,10 +1692,40 @@ async function invokeWithQueue(
               // submission result, which is the stage this attempt failed at.
               stage: "broadcast",
             });
-            const bumped = BigInt(
+            const scaled = BigInt(
               Math.ceil(Number(currentInclusionFee) * feeOptions.feeMultiplier),
             );
-            currentInclusionFee = bumped > currentInclusionFee ? bumped : currentInclusionFee + 100n;
+            const bumped = scaled > currentInclusionFee ? scaled : currentInclusionFee + 100n;
+            // A hard ceiling stops the retry loop before the over-cap
+            // transaction can be broadcast; the outcome carries the attempted
+            // fee and ceiling as a typed error.
+            if (feeOptions.maxInclusionFee !== undefined && bumped > feeOptions.maxInclusionFee) {
+              const capError = new FeeCapExceededError({
+                maxFeeCap: feeOptions.maxInclusionFee,
+                resourceFeeStroops: 0n,
+                inclusionFeeStroops: bumped,
+                attempt: generalAttempt,
+              });
+              const capped: InvokeErrorOutcome = {
+                kind: "error",
+                detail: capError.message,
+                error: capError,
+                diagnosticEvents: [],
+                retry: {
+                  ...metadata(
+                    "error",
+                    "min_fee",
+                    RETRYABLE_CAUSES.min_fee,
+                    true,
+                    feeOptions.maxAttempts,
+                  ),
+                  maxInclusionFeeStroops: feeOptions.maxInclusionFee.toString(),
+                },
+              };
+              logTerminalOutcome(logger, capped);
+              return capped;
+            }
+            currentInclusionFee = bumped;
             continue;
           }
 
@@ -1638,7 +1810,9 @@ async function invokeWithQueue(
       if (error instanceof RpcTimeoutError) return deadlineErrorOutcome(error);
       throw error;
     }
-  });
+    },
+    params.onQueue,
+  );
 }
 
 /**

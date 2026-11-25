@@ -355,6 +355,28 @@ export interface PreFlightBatchDecision {
 /** A caller-supplied policy revision token used as part of the cache key. */
 export type PolicyRevision = string | number | bigint | boolean | null | undefined;
 
+/** Per-call bound shared by `warmCache()`'s checks. */
+export interface WarmCacheOptions {
+  /** Abort signal forwarded to every warmed `check()`. */
+  signal?: AbortSignal | undefined;
+  /** Per-RPC timeout forwarded to every warmed `check()`. */
+  timeoutMs?: number | undefined;
+}
+
+/** What `warmCache()` did, which is an optimization report — not a verdict. */
+export interface WarmCacheSummary {
+  /** Calls passed to `warmCache()`. */
+  attempted: number;
+  /** Verdicts stored (or already served from) the cache; `0` when disabled. */
+  cached: number;
+  /** Blocked verdicts, reported rather than thrown. */
+  blocked: number;
+  /** Verdicts that could not be determined, reported rather than thrown. */
+  undetermined: number;
+  /** Wall-clock duration of the warming pass, in milliseconds. */
+  durationMs: number;
+}
+
 /**
  * Per-call options for `check()`.
  *
@@ -585,6 +607,28 @@ type CacheLookup =
   | { kind: "unavailable" }
   | { kind: "bounded"; error: RpcTimeoutError };
 
+/**
+ * The fail-closed verdict for an unexpected throw escaping `check()`.
+ *
+ * The original value becomes `cause` whether or not it is an `Error`, so a
+ * string or plain-object rejection is preserved rather than stringified away.
+ * The verdict is always `undetermined`: a failure the guard did not rule on
+ * can never be reported as `admissible`.
+ */
+function undeterminedFromThrow(cause: unknown): PreFlightDecision {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  const message = `pre-flight enforcement failed unexpectedly: ${detail}`;
+  return {
+    allowed: false,
+    kind: "undetermined",
+    detail: message,
+    error:
+      cause instanceof GuardUndeterminedError
+        ? cause
+        : new GuardUndeterminedError(message, { stage: "preflight", cause, detail }),
+  };
+}
+
 /** The fail-closed verdict for a caller bound that fired. */
 function timeoutDecision(error: RpcTimeoutError): PreFlightDecision {
   const outcome = timeoutOutcome(error);
@@ -644,6 +688,7 @@ export class PreFlightInterceptor {
   private _hits = 0;
   private _misses = 0;
   private _invalidations = 0;
+  private _stores = 0;
 
   constructor(input: PreFlightConfigInput) {
     // Shared transport (issue #117): exactly one of `server` or `url`.
@@ -732,6 +777,7 @@ export class PreFlightInterceptor {
       }
     }
     this.cache.set(key, entry);
+    this._stores += 1;
   }
 
   private cacheTtlMs(): number {
@@ -851,8 +897,29 @@ export class PreFlightInterceptor {
    * work against its own bound instead.
    */
   async check(call: ContractCall, options?: PreFlightCheckOptions): Promise<PreFlightDecision> {
+    // Invalid caller input stays a synchronous-shaped, unwrapped rejection: it
+    // is a programmer error, not an enforcement result.
     validateContractCall(call);
+    try {
+      return await this.checkUnwrapped(call, options);
+    } catch (cause) {
+      if (cause instanceof InvalidInputError) throw cause;
+      return undeterminedFromThrow(cause);
+    }
+  }
 
+  /**
+   * The check itself, after validation.
+   *
+   * Kept separate so every throw site reachable from enforcement is caught in
+   * `check()` and converted into a fail-closed `undetermined` verdict: an
+   * unexpected non-`GuardError` (a custom `Clock`, an injected server, a
+   * mapper) must never escape and be misclassified by an adapter.
+   */
+  private async checkUnwrapped(
+    call: ContractCall,
+    options?: PreFlightCheckOptions,
+  ): Promise<PreFlightDecision> {
     // An already-aborted caller asks for no work at all, including the cache
     // lookup's ledger read. Answer before any RPC or in-flight registration.
     if (options?.signal?.aborted) {
@@ -1405,6 +1472,53 @@ export class PreFlightInterceptor {
             },
           }
         : {}),
+    };
+  }
+
+  /**
+   * Populate the cache deliberately for a known set of calls.
+   *
+   * Runs each call through the same `check()` path, so warming uses exactly the
+   * cache a later check would consult: the same ledger marker, TTL, policy
+   * revision and `maxEntries` eviction. Only cacheable `admissible` and
+   * `blocked` verdicts are stored; `undetermined` verdicts are not (and never
+   * were). A blocked or undetermined call is reported in the summary, never
+   * thrown.
+   *
+   * Warming is an optimization, not a guarantee: a warmed verdict can be stale
+   * or evicted before the call it was meant for, and another process does not
+   * share this cache. With caching disabled by config (`cache` omitted) nothing
+   * is stored and `cached` is `0`.
+   */
+  async warmCache(
+    calls: ContractCall[],
+    options?: WarmCacheOptions,
+  ): Promise<WarmCacheSummary> {
+    const startedAt = this.clock.now();
+    let cached = 0;
+    let blocked = 0;
+    let undetermined = 0;
+
+    for (const call of calls) {
+      const hitsBefore = this._hits;
+      const storesBefore = this._stores;
+      const decision = await this.check(call, options);
+      if (decision.kind === "undetermined") {
+        undetermined += 1;
+        continue;
+      }
+      if (decision.kind === "blocked") blocked += 1;
+      // "Cached" means a later check can reuse this verdict: either this pass
+      // stored it, or it was already served from the cache.
+      if (this._hits > hitsBefore || this._stores > storesBefore) cached += 1;
+    }
+
+    return {
+      attempted: calls.length,
+      cached,
+      blocked,
+      undetermined,
+      durationMs: this.clock.now() - startedAt,
     };
   }
 

@@ -965,10 +965,25 @@ export class PreFlightInterceptor {
     // Input validation throws before a verdict exists, so it never reaches the
     // observer: `onVerdict` reports decisions, not caller mistakes.
     validateContractCall(call);
-    const startedAt = this.clock.now();
-    const result = await this.decide(call, options);
-    this.emitVerdict(call, result.decision, startedAt, result.cached, result.ledger);
-    return result.decision;
+    let startedAt: number | undefined;
+    try {
+      startedAt = this.clock.now();
+      const result = await this.decide(call, options);
+      this.emitVerdict(call, result.decision, startedAt, result.cached, result.ledger);
+      return result.decision;
+    } catch (cause) {
+      // Every other throwable is a fail-closed verdict, not a rejection: an
+      // unexpected failure (a custom `Clock`, an injected server, a mapper)
+      // must never escape and be misclassified by an adapter.
+      if (cause instanceof InvalidInputError) throw cause;
+      const decision = undeterminedFromThrow(cause);
+      // The observer needs the clock that just failed, so a broken clock must
+      // not turn the fail-closed verdict back into a rejection.
+      if (startedAt !== undefined) {
+        this.emitVerdict(call, decision, startedAt, false, undefined);
+      }
+      return decision;
+    }
   }
 
   /**
@@ -990,18 +1005,6 @@ export class PreFlightInterceptor {
       return { decision, cached: false, ledger: undefined };
     }
 
-  /**
-   * The check itself, after validation.
-   *
-   * Kept separate so every throw site reachable from enforcement is caught in
-   * `check()` and converted into a fail-closed `undetermined` verdict: an
-   * unexpected non-`GuardError` (a custom `Clock`, an injected server, a
-   * mapper) must never escape and be misclassified by an adapter.
-   */
-  private async checkUnwrapped(
-    call: ContractCall,
-    options?: PreFlightCheckOptions,
-  ): Promise<PreFlightDecision> {
     // An already-aborted caller asks for no work at all, including the cache
     // lookup's ledger read. Answer before any RPC or in-flight registration.
     if (options?.signal?.aborted) {
@@ -1121,10 +1124,16 @@ export class PreFlightInterceptor {
   ): void {
     const hook = this.config.onVerdict;
     if (!hook) return;
+    let now = startedAt;
+    try {
+      now = this.clock.now();
+    } catch {
+      /* a broken clock cannot stop the verdict from being reported */
+    }
     const event: PreFlightVerdictEvent = {
       kind: decision.kind,
       cached,
-      durationMs: Math.max(0, this.clock.now() - startedAt),
+      durationMs: Math.max(0, now - startedAt),
       call: { fn: call.fn, contract: call.contract },
       ...(decision.kind === "blocked" ? { reason: decision.reason } : {}),
       ...(ledger !== undefined ? { ledger } : {}),

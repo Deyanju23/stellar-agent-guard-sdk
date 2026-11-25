@@ -836,7 +836,7 @@ describe("invoke sequence reservation", () => {
     const onQueue = (event: InvokeQueueEvent) => {
       events.push(event);
     };
-    const before = invokeQueueStats();
+    const before = invokeQueueStats(server);
     const first = invoke({ ...params, onQueue });
     await new Promise<void>((resolve) => setImmediate(resolve));
     const second = invoke({ ...params, onQueue });
@@ -863,7 +863,7 @@ describe("invoke sequence reservation", () => {
       "acquisition events fire in FIFO order",
     );
 
-    const after = invokeQueueStats();
+    const after = invokeQueueStats(server);
     assert.equal(after.depth, 0);
     assert.equal(after.enqueued - before.enqueued, 2);
     assert.ok(after.totalWaitedMs >= before.totalWaitedMs);
@@ -876,7 +876,15 @@ describe("invoke sequence reservation", () => {
       },
     });
     assert.equal(third.kind, "allowed");
-    assert.equal(invokeQueueStats().depth, 0);
+    assert.equal(invokeQueueStats(server).depth, 0);
+
+    // Counters live on the server's queue state, not the module: another
+    // server sees none of this run's numbers (no cross-test contamination).
+    assert.deepEqual(
+      invokeQueueStats({} as unknown as rpc.Server),
+      { depth: 0, totalWaitedMs: 0, enqueued: 0 },
+      "a second server starts from zero",
+    );
   });
 });
 

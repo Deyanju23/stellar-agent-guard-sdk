@@ -622,15 +622,17 @@ export interface InvokeParams {
    */
   onRetry?: ((event: InvokeRetryEvent) => void) | undefined;
   /**
-   * Optional hook reporting this process's per-source-account queue.
+   * Optional hook reporting the per-source-account queue of the RPC server
+   * handling the call.
    *
    * `waiting` fires when a call joins the queue (before its turn), and
    * `acquired` when it starts running, so a busy fleet can be told apart from a
    * slow RPC. Events are emitted in acquisition (FIFO) order. The hook is
    * isolated like `onStep`: a throw is swallowed and can never stall the queue.
    *
-   * The queue and its counters are per process, not global: another process
-   * using the same source account is invisible here.
+   * The queue and its counters belong to that server object and process, not
+   * to a global: another process using the same source account is invisible
+   * here, and {@link invokeQueueStats} scopes to one server when given one.
    */
   onQueue?: ((event: InvokeQueueEvent) => void) | undefined;
   /**
@@ -1358,7 +1360,7 @@ export interface InvokeQueueEvent {
   kind: "waiting" | "acquired";
   /** Source account public key whose queue emitted the event. */
   source: string;
-  /** Calls ahead of this one: queued waiters plus the running call. */
+  /** Calls ahead of this one: queued waiters plus the running call; `0` once acquired. */
   depth: number;
   /** Time spent waiting, in milliseconds: `0` on `waiting`. */
   waitedMs: number;
@@ -1366,35 +1368,96 @@ export interface InvokeQueueEvent {
   acquired: boolean;
 }
 
-/** Snapshot of this process's invoke queues. */
+/** Snapshot of invoke queues. */
 export interface InvokeQueueStats {
-  /** Calls currently waiting for their turn across all accounts. */
+  /** Calls currently waiting for their turn across the measured accounts. */
   depth: number;
-  /** Cumulative queue wait observed since the process started, in ms. */
+  /** Cumulative queue wait observed by the measured queues, in ms. */
   totalWaitedMs: number;
-  /** Calls enqueued since the process started. */
+  /** Calls enqueued on the measured queues. */
   enqueued: number;
 }
 
-// Process-local queue counters: they reset when the process restarts, and they
-// cannot see another process that shares the same source account.
-let queueWaiters = 0;
-let cumulativeQueueWaitMs = 0;
-let enqueuedCalls = 0;
+/**
+ * Live counters for the queues of one `rpc.Server`.
+ *
+ * Owned by that server's queue context, not by the module, so two servers (or
+ * two tests) never share a counter and nothing leaks between unrelated runs.
+ */
+type QueueMetrics = {
+  depth: number;
+  totalWaitedMs: number;
+  enqueued: number;
+};
+
+/** The queue state owned by one `rpc.Server` object. */
+type ServerQueueState = {
+  accounts: Map<string, AccountState>;
+  metrics: QueueMetrics;
+};
+
+const serverQueues = new WeakMap<object, ServerQueueState>();
+
+// Live contexts, so the no-argument snapshot can sum this process's queues
+// without module-level counters. Weak refs keep an abandoned server collectable;
+// dead entries are pruned whenever the snapshot is taken.
+const liveServerQueues = new Set<WeakRef<ServerQueueState>>();
+
+function serverQueueFor(server: rpc.Server): ServerQueueState {
+  let state = serverQueues.get(server);
+  if (!state) {
+    state = {
+      accounts: new Map<string, AccountState>(),
+      metrics: { depth: 0, totalWaitedMs: 0, enqueued: 0 },
+    };
+    serverQueues.set(server, state);
+    liveServerQueues.add(new WeakRef(state));
+    // A transport that builds a server per call would otherwise leave one dead
+    // weak ref behind per call. Keep the registry proportional to live contexts.
+    if (liveServerQueues.size > 32) pruneDeadServerQueues();
+  }
+  return state;
+}
+
+function pruneDeadServerQueues(): void {
+  for (const ref of liveServerQueues) {
+    if (ref.deref() === undefined) liveServerQueues.delete(ref);
+  }
+}
 
 /**
- * Snapshot this process's invoke-queue depth and cumulative wait.
+ * Snapshot invoke-queue depth and cumulative wait.
+ *
+ * Pass the `rpc.Server` whose queues you own to measure exactly its accounts:
+ * the counters live on that server's queue state, so another server — or a
+ * test that already ran — cannot contribute. Called without a server, the
+ * snapshot sums every server context still alive in this process.
  *
  * Per process by construction: a queue is owned by the process that holds the
  * source account's sequence, so a second process is neither counted nor
  * coordinated with here.
  */
-export function invokeQueueStats(): InvokeQueueStats {
-  return {
-    depth: queueWaiters,
-    totalWaitedMs: cumulativeQueueWaitMs,
-    enqueued: enqueuedCalls,
-  };
+export function invokeQueueStats(server?: rpc.Server): InvokeQueueStats {
+  const contexts = server === undefined ? liveServerQueueStates() : [serverQueueFor(server)];
+  let depth = 0;
+  let totalWaitedMs = 0;
+  let enqueued = 0;
+  for (const context of contexts) {
+    depth += context.metrics.depth;
+    totalWaitedMs += context.metrics.totalWaitedMs;
+    enqueued += context.metrics.enqueued;
+  }
+  return { depth, totalWaitedMs, enqueued };
+}
+
+function liveServerQueueStates(): ServerQueueState[] {
+  const live: ServerQueueState[] = [];
+  for (const ref of liveServerQueues) {
+    const context = ref.deref();
+    if (context === undefined) liveServerQueues.delete(ref);
+    else live.push(context);
+  }
+  return live;
 }
 
 /** Emit a queue event without letting a broken consumer stall the queue. */
@@ -1410,18 +1473,12 @@ function emitQueue(
   }
 }
 
-const accountStates = new WeakMap<object, Map<string, AccountState>>();
-
 function accountStateFor(server: rpc.Server, publicKey: string): AccountState {
-  let states = accountStates.get(server);
-  if (!states) {
-    states = new Map<string, AccountState>();
-    accountStates.set(server, states);
-  }
-  let state = states.get(publicKey);
+  const accounts = serverQueueFor(server).accounts;
+  let state = accounts.get(publicKey);
   if (!state) {
     state = { queue: Promise.resolve(), waiting: 0, running: false };
-    states.set(publicKey, state);
+    accounts.set(publicKey, state);
   }
   return state;
 }
@@ -1440,12 +1497,13 @@ async function withAccountQueue<T>(
   task: () => Promise<T>,
   onQueue?: ((event: InvokeQueueEvent) => void) | undefined,
 ): Promise<T> {
+  const metrics = serverQueueFor(server).metrics;
   const state = accountStateFor(server, publicKey);
   const ahead = state.waiting + (state.running ? 1 : 0);
   const queuedAt = performance.now();
   state.waiting += 1;
-  queueWaiters += 1;
-  enqueuedCalls += 1;
+  metrics.depth += 1;
+  metrics.enqueued += 1;
   emitQueue(onQueue, {
     kind: "waiting",
     source: publicKey,
@@ -1462,13 +1520,13 @@ async function withAccountQueue<T>(
   await previous;
   const waitedMs = performance.now() - queuedAt;
   state.waiting -= 1;
-  queueWaiters -= 1;
-  cumulativeQueueWaitMs += waitedMs;
+  metrics.depth -= 1;
+  metrics.totalWaitedMs += waitedMs;
   state.running = true;
   emitQueue(onQueue, {
     kind: "acquired",
     source: publicKey,
-    depth: state.waiting,
+    depth: 0,
     waitedMs,
     acquired: true,
   });

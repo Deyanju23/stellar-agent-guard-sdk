@@ -1308,7 +1308,7 @@ Every caller-controlled option is validated before any signing or RPC; a bad val
 | `clock` | `Clock` | `systemClock` | Time source for deadline accounting and poll/backoff delays. Must have `now()` and `sleep()`. |
 | `onStep` | `(step: InvokeStepEvent) => void` | none | One event per stage attempt (probe → sign → simulate → broadcast). Exceptions are isolated. |
 | `onSubmitted` | `(event: SubmissionAcceptedEvent) => void` | none | Called once with the network's answer to the broadcast, before polling, so the transaction hash survives a failed poll. |
-| `onQueue` | `(event: InvokeQueueEvent) => void` | none | Per-source-account queue observability: `waiting` on join, `acquired` when the call runs, with `source`, `depth`, `waitedMs`, `acquired`. Isolated like `onStep`. The queue and `invokeQueueStats()` are per process, not global. |
+| `onQueue` | `(event: InvokeQueueEvent) => void` | none | Per-source-account queue observability: `waiting` on join, `acquired` when the call runs, with `source`, `depth`, `waitedMs`, `acquired`. Isolated like `onStep`. Counters belong to the `rpc.Server` object's queue state, so `invokeQueueStats(server)` reports only that server's accounts and `invokeQueueStats()` sums the live server contexts in this process — the queue is per server object and process, never global. |
 | `logger` | `GuardLoggerInput` | none — silent | Stage attempts and retries at `debug`, a refusal at `info`, no-verdict outcomes at `warn`. Never changes behaviour. |
 
 ### Interception & Execution

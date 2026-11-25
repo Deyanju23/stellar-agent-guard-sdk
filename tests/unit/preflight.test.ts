@@ -1205,7 +1205,7 @@ describe("check() typed-failure boundary (issue #412)", () => {
 
   it("keeps InvalidInputError unwrapped and preserves the original value from a throwing clock", async () => {
     const harness = makeHarness();
-    let thrown: unknown;
+    const thrown: unknown = "clock boom";
     const clock: Clock = {
       now: () => {
         throw thrown;
@@ -1222,7 +1222,6 @@ describe("check() typed-failure boundary (issue #412)", () => {
       clock,
     });
 
-    thrown = "clock boom";
     const decision = await interceptor.check(harness.call);
     assert.equal(decision.kind, "undetermined");
     assert.ok(decision.error instanceof GuardUndeterminedError);

@@ -34,7 +34,12 @@ import {
 } from "../../src/invoke.ts";
 import type { InvokeParams } from "../../src/invoke.ts";
 import { BroadcastError } from "../../src/tx.ts";
-import { ContractResponseError, InvalidInputError, SimulationError } from "../../src/errors.ts";
+import {
+  ContractResponseError,
+  FeeCapExceededError,
+  InvalidInputError,
+  SimulationError,
+} from "../../src/errors.ts";
 import { RpcTimeoutError } from "../../src/invoke.ts";
 import { FakeClock, type Clock } from "../../src/clock.ts";
 import { TRACE_STEP_NAMES, type TraceStepName } from "../../src/trace.ts";
@@ -1258,19 +1263,12 @@ describe("invoke() fee-bump retry lifecycle", () => {
     // ceiling, so it is never broadcast.
     assert.equal(sendCalls.length, 1);
     assert.equal(outcome.kind, "error");
-    assert.ok(outcome instanceof BroadcastError === false);
-    assert.equal(outcome.kind === "error" ? outcome.error.name : undefined, "FeeCapExceededError");
-    assert.equal(
-      outcome.kind === "error" && outcome.error.name === "FeeCapExceededError"
-        ? outcome.error.code
-        : undefined,
-      "fee_cap_exceeded",
-    );
-    assert.match(
-      outcome.kind === "error" ? outcome.error.message : "",
-      /maxFeeCap 700/,
-      "the ceiling is in the error message",
-    );
+    const capError = outcome.kind === "error" ? outcome.error : undefined;
+    assert.ok(capError instanceof FeeCapExceededError);
+    assert.equal(capError.code, "fee_cap_exceeded");
+    assert.equal(capError.maxFeeCap, 700n);
+    assert.equal(capError.inclusionFeeStroops, 1_000n);
+    assert.match(capError.message, /maxFeeCap 700/, "the ceiling is in the error message");
     assert.equal(
       outcome.kind === "error" ? outcome.retry?.maxInclusionFeeStroops : undefined,
       "700",

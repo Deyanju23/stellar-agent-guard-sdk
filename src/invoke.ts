@@ -25,6 +25,8 @@ import {
   GuardError,
   SigningError,
   SimulationError,
+  guardErrorToJSON,
+  type GuardErrorJSON,
 } from "./errors.ts";
 import { GUARD_AUTH_RESULTS, decodeAuthDecision } from "./events.ts";
 import {
@@ -361,6 +363,11 @@ export class InvokeRetryError extends Error {
       terminalCause: lastCause,
       outcome: "error",
     };
+  }
+
+  /** JSON-safe representation for structured loggers. */
+  toJSON(): GuardErrorJSON {
+    return guardErrorToJSON(this);
   }
 }
 
